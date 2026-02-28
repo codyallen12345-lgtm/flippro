@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>FlipPro ⚡</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800;900&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0f;color:#e2e8f0;font-family:'Syne',sans-serif;min-height:100vh}
+input,select,textarea,button{font-family:'Syne',sans-serif}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+const STORAGE_KEY = "flipper-pro-v1";
+const BUDGET_KEY  = "flipper-pro-budget";
+const EBAY_KEY    = "flipper-pro-ebay";
+const SPEND_KEY   = "flipper-pro-spending";
+
+const CATEGORIES = {
+  pokemon:     { label: "Pokémon",     icon: "⚡", color: "#f0c040", accent: "#ff6b35", type: "card", ebayCategory: "183454" },
+  yugioh:      { label: "Yu-Gi-Oh!",  icon: "👁", color: "#a855f7", accent: "#7c3aed", type: "card", ebayCategory: "183454" },
+  magic:       { label: "Magic",       icon: "✦",  color: "#3b82f6", accent: "#1d4ed8", type: "card", ebayCategory: "183454" },
+  onepiece:    { label: "One Piece",   icon: "☠",  color: "#ef4444", accent: "#b91c1c", type: "card", ebayCategory: "183454" },
+  electronics: { label: "Electronics", icon: "📱", color: "#06b6d4", accent: "#0891b2", type: "item", ebayCategory: "58058"  },
+  sneakers:    { label: "Sneakers",    icon: "👟", color: "#f97316", accent: "#ea580c", type: "item", ebayCategory: "15709"  },
+  clothing:    { label: "Clothing",    icon: "👕", color: "#ec4899", accent: "#db2777", type: "item", ebayCategory: "11450"  },
+  vintage:     { label: "Vintage",     icon: "🏺", color: "#84cc16", accent: "#65a30d", type: "item", ebayCategory: "353"    },
+  toys:        { label: "Toys",        icon: "🧸", color: "#f59e0b", accent: "#d97706", type: "item", ebayCategory: "220"    },
+  other:       { label: "Other",       icon: "📦", color: "#94a3b8", accent: "#64748b", type: "item", ebayCategory: "99"     },
+};
+
+const CARD_CATS  = Object.entries(CATEGORIES).filter(([,v])=>v.type==="card");
+const ITEM_CATS  = Object.entries(CATEGORIES).filter(([,v])=>v.type==="item");
+const CONDITION_MAP = { NM:"Near Mint or Better", LP:"Lightly Played", MP:"Moderately Played", New:"New", LikeNew:"Like New", Good:"Good", Fair:"Fair", Poor:"Poor" };
+const CARD_CONDITIONS = ["NM","LP","MP"];
+const ITEM_CONDITIONS = ["New","LikeNew","Good","Fair","Poor"];
+const callAI = async (messages, maxTokens=900) => {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:maxTokens, messages }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content[0].text;
+};
+const parseJSON = (t) => JSON.parse(t.replace(/```json|```/g,"").trim());
+
+const compressImage = (b64, mime) => new Promise((res) => {
+  const img = new Image();
+  img.onload = () => {
+    const MAX = 800;
+    const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale);
+    const h = Math.round(img.height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+    const compressed = canvas.toDataURL("image/jpeg", 0.7).split(",")[1];
+    res(compressed);
+  };
+  img.onerror = () => res(b64);
+  img.src = `data:${mime};base64,${b64}`;
+});
+
+const fileToBase64 = (file) => new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(",")[1]); r.onerror=rej; r.readAsDataURL(file); });
+
+const analyzeCard = async (content, game, isImage, mime) => {
+  const g = CATEGORIES[game];
+  const msg = isImage
+    ? [{ type:"image", source:{ type:"base64", media_type:mime, data:content } }, { type:"text", text:`You are a ${g.label} TCG pricing expert. Identify this card and give current eBay sold prices.\nReturn ONLY JSON:\n{"name":"full card name","set":"set","rarity":"rarity","nmPrice":0.00,"lpPrice":0.00,"mpPrice":0.00,"trend":"stable","notes":"one sentence","confidence":"high","ebayTitle":"optimized 80-char title"}` }]
+    : `You are a ${g.label} TCG expert. Identify: "${content}"\nReturn ONLY JSON: {"name":"full name","set":"set","rarity":"rarity","nmPrice":0.00,"lpPrice":0.00,"mpPrice":0.00,"trend":"stable","notes":"one sentence","ebayTitle":"optimized 80-char title"}`;
+  const text = await callAI([{ role:"user", content: msg }]);
+  return parseJSON(text);
+};
+
+const analyzeItem = async (content, category, isImage, mime) => {
+  const g = CATEGORIES[category];
+  const msg = isImage
+    ? [{ type:"image", source:{ type:"base64", media_type:mime, data:content } }, { type:"text", text:`You are an eBay reselling expert specializing in ${g.label}. Identify this item from the photo and estimate current eBay sold prices.\nReturn ONLY JSON:\n{"name":"full item name/model","brand":"brand if visible","condition":"your assessment","lowPrice":0.00,"midPrice":0.00,"highPrice":0.00,"trend":"stable","notes":"one sentence market note","confidence":"high","ebayTitle":"optimized 80-char eBay title","suggestedCategory":"${g.label}"}` }]
+    : `You are an eBay reselling expert. I want to sell: "${content}" (category: ${g.label})\nReturn ONLY JSON: {"name":"full item name","brand":"brand","condition":"unknown","lowPrice":0.00,"midPrice":0.00,"highPrice":0.00,"trend":"stable","notes":"one sentence","ebayTitle":"optimized 80-char eBay title","suggestedCategory":"${g.label}"}`;
+  const text = await callAI([{ role:"user", content: msg }]);
+  return parseJSON(text);
+};
+
+const scoutItem = async (content, isImage, mime, askPrice) => {
+  const msg = isImage
+    ? [{ type:"image", source:{ type:"base64", media_type:mime, data:content } }, { type:"text", text:`You are an expert eBay reseller. Analyze this item. ${askPrice ? `Asking $${askPrice}.` : ""}\nReturn ONLY JSON:\n{"name":"full item name","category":"pokemon/yugioh/magic/onepiece/electronics/sneakers/clothing/vintage/toys/other","confidence":"high/medium/low","lowSell":0.00,"midSell":0.00,"highSell":0.00,"verdict":"BUY / PASS / NEGOTIATE","verdictReason":"one sentence","maxPayPrice":0.00,"estimatedProfit":0.00,"riskLevel":"low/medium/high","riskReason":"why","demandLevel":"hot/steady/slow","timeToSell":"estimate","tips":["tip1","tip2","tip3"],"redFlags":[],"conditionNotes":"condition assessment"}` }]
+    : `You are an expert eBay reseller. Item: "${content}"${askPrice?` asking $${askPrice}`:""}\nReturn ONLY JSON: {"name":"full name","category":"pokemon/yugioh/magic/onepiece/electronics/sneakers/clothing/vintage/toys/other","confidence":"high","lowSell":0.00,"midSell":0.00,"highSell":0.00,"verdict":"BUY / PASS / NEGOTIATE","verdictReason":"one sentence","maxPayPrice":0.00,"estimatedProfit":0.00,"riskLevel":"low/medium/high","riskReason":"why","demandLevel":"hot/steady/slow","timeToSell":"estimate","tips":["tip1","tip2"],"redFlags":[],"conditionNotes":"unknown"}`;
+  const text = await callAI([{ role:"user", content: msg }], 1000);
+  return parseJSON(text);
+};
+
+const genDescription = async (name, condition, category, extra={}) => {
+  const g = CATEGORIES[category];
+  const text = await callAI([{ role:"user", content:`Write a professional eBay listing description for:\nItem: ${name}\nCategory: ${g.label}\nCondition: ${CONDITION_MAP[condition]||condition}\nUnder 200 words. Professional tone. No markdown.` }], 400);
+  return text.trim();
+};
+const SHIP_PRESETS = {
+  pokemon:     { name:"PWE/Bubble Mailer", weightOz:1.5,  l:6,  w:4,  h:0.5 },
+  yugioh:      { name:"PWE/Bubble Mailer", weightOz:1.5,  l:6,  w:4,  h:0.5 },
+  magic:       { name:"PWE/Bubble Mailer", weightOz:1.5,  l:6,  w:4,  h:0.5 },
+  onepiece:    { name:"PWE/Bubble Mailer", weightOz:1.5,  l:6,  w:4,  h:0.5 },
+  electronics: { name:"Small Box",        weightOz:16,   l:12, w:9,  h:4   },
+  sneakers:    { name:"Shoe Box",         weightOz:48,   l:14, w:8,  h:5   },
+  clothing:    { name:"Poly Mailer",      weightOz:12,   l:12, w:10, h:1   },
+  vintage:     { name:"Medium Box",       weightOz:32,   l:12, w:12, h:8   },
+  toys:        { name:"Medium Box",       weightOz:24,   l:12, w:10, h:6   },
+  other:       { name:"Small Box",        weightOz:16,   l:10, w:8,  h:4   },
+};
+
+const calcUSPS = (weightOz, l, w, h) => {
+  const lb = weightOz / 16;
+  if (weightOz <= 13) {
+    const base = weightOz<=1?0.68:weightOz<=2?0.91:weightOz<=3?1.14:weightOz<=4?1.37:weightOz<=6?1.70:weightOz<=8?2.10:weightOz<=10?2.50:2.89;
+    return { service:"USPS First Class", cost: base + 0.20, days:"2-5" };
+  }
+  if (l<=8.625&&w<=5.375&&h<=1.625) return { service:"USPS Priority Flat Rate Sm", cost:9.85, days:"1-3" };
+  if (l<=11&&w<=8.5&&h<=5.5) return { service:"USPS Priority Flat Rate Med", cost:16.10, days:"1-3" };
+  if (lb<=1) return { service:"USPS Priority Mail", cost:9.35, days:"1-3" };
+  if (lb<=2) return { service:"USPS Priority Mail", cost:10.40, days:"1-3" };
+  if (lb<=5) return { service:"USPS Priority Mail", cost:14.50, days:"1-3" };
+  return { service:"USPS Priority Mail", cost:19.80, days:"1-3" };
+};
+
+const calcUPS = (weightOz) => {
+  const lb = Math.max(1, Math.ceil(weightOz/16));
+  const rates = [0,10.20,11.30,12.50,14.00,16.20,18.50,21.00,24.50,28.00,32.00];
+  const cost = lb<=10 ? rates[lb] : 32+(lb-10)*2.80;
+  return { service:"UPS Ground", cost: parseFloat(cost.toFixed(2)), days:"1-5" };
+};
+
+const calcShipping = (weightOz, l, w, h) => {
+  const usps = calcUSPS(weightOz, l, w, h);
+  const ups  = calcUPS(weightOz);
+  return { usps, ups, recommended: usps.cost <= ups.cost ? usps : ups };
+};
+
+const CSV_HEADERS = ["Title","Category","Format","StartPrice","Quantity","ConditionID","Description","Location","Currency"].join(",");
+
+const buildRow = (flip, desc, settings) => {
+  const price = ((flip.midPrice||0)*(1+(settings.markup||10)/100)).toFixed(2);
+  const condId = (flip.condition==="New"||flip.condition==="NM")?"1000":"3000";
+  return [`"${(flip.listedTitle||flip.name||"").slice(0,80)}"`,`"${CATEGORIES[flip.category]?.ebayCategory||"99"}"`,`"Fixed Price"`,`"${price}"`,`"1"`,`"${condId}"`,`"${(desc||"").replace(/"/g,"'")}"`,`"United States"`,`"USD"`].join(",");
+};
+
+const downloadCSV = (rows) => {
+  const csv=[CSV_HEADERS,...rows].join("\n");
+  const blob=new Blob([csv],{type:"text/csv"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a"); a.href=url; a.download=`flippro-${Date.now()}.csv`; a.click();
+};
+
+const Pill = ({label,color="#f0c040"}) => (
+  <span style={{background:color+"22",color,border:`1px solid ${color}44`,borderRadius:99,padding:"2px 10px",fontSize:11,fontWeight:700,letterSpacing:0.5,textTransform:"uppercase"}}>{label}</span>
+);
+const trendColor = (t) => t==="rising"?"#4ade80":t==="falling"?"#f87171":"#94a3b8";
+const trendIcon  = (t) => t==="rising"?"↑":t==="falling"?"↓":"→";
+const CatBadge   = ({cat}) => { const g=CATEGORIES[cat]||CATEGORIES.other; return <Pill label={`${g.icon} ${g.label}`} color={g.color}/>; };
+
+const S = {
+  app:  {minHeight:"100vh",background:"#0a0a0f",color:"#e2e8f0",fontFamily:"'Syne',sans-serif",padding:0},
+  hdr:  {background:"linear-gradient(135deg,#0f0f1a,#1a1028)",borderBottom:"1px solid #ffffff10",padding:"20px 20px 0"},
+  logo: {fontSize:22,fontWeight:900,letterSpacing:-1,background:"linear-gradient(90deg,#f0c040,#06b6d4)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:4},
+  sub:  {color:"#64748b",fontSize:12,marginBottom:16},
+  srow: {display:"flex",gap:20,marginBottom:0,flexWrap:"wrap"},
+  tabs: {display:"flex",gap:0,marginTop:16,overflowX:"auto"},
+  tab:  (a,c="#f0c040")=>({padding:"10px 14px",background:"none",border:"none",borderBottom:a?`2px solid ${c}`:"2px solid transparent",color:a?c:"#64748b",fontWeight:700,fontSize:12,cursor:"pointer",whiteSpace:"nowrap"}),
+  wrap: {padding:"20px 16px",maxWidth:700,margin:"0 auto"},
+  card: {background:"#0f0f1a",border:"1px solid #ffffff0f",borderRadius:16,padding:20,marginBottom:16},
+  inp:  {width:"100%",background:"#ffffff08",border:"1px solid #ffffff15",borderRadius:10,padding:"12px 14px",color:"#e2e8f0",fontSize:14,outline:"none",boxSizing:"border-box",fontFamily:"inherit"},
+  btn:  (v="primary",c="#f0c040",a="#ff6b35")=>({padding:"11px 18px",borderRadius:10,border:"none",fontWeight:700,fontSize:13,cursor:"pointer",whiteSpace:"nowrap",background:v==="primary"?`linear-gradient(135deg,${c},${a})`:v==="danger"?"#ef444422":v==="cam"?"linear-gradient(135deg,#0ea5e9,#6366f1)":v==="ebay"?"linear-gradient(135deg,#e53238,#f5af02)":"#ffffff0a",color:v==="primary"||v==="cam"||v==="ebay"?"#fff":v==="danger"?"#f87171":"#94a3b8"}),
+  lbl:  {fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:1,marginBottom:6,display:"block"},
+  pg:   {display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginTop:12},
+  pb:   (c)=>({background:c+"11",border:`1px solid ${c}33`,borderRadius:10,padding:"10px 12px",textAlign:"center"}),
+  fc:   {background:"#0f0f1a",border:"1px solid #ffffff0f",borderRadius:14,padding:16,marginBottom:12},
+};
+function CategoryPicker({ value, onChange }) {
+  return (
+    <div>
+      <label style={S.lbl}>TCG Cards</label>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:12}}>
+        {CARD_CATS.map(([key,g])=>(
+          <button key={key} onClick={()=>onChange(key)} style={{padding:"10px 8px",borderRadius:12,border:value===key?`2px solid ${g.color}`:"2px solid #ffffff10",background:value===key?g.color+"15":"#ffffff05",color:value===key?g.color:"#64748b",fontWeight:700,fontSize:11,cursor:"pointer",textAlign:"center"}}>
+            <div style={{fontSize:20,marginBottom:4}}>{g.icon}</div>
+            <div>{g.label}</div>
+          </button>
+        ))}
+      </div>
+      <label style={S.lbl}>General Items</label>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+        {ITEM_CATS.map(([key,g])=>(
+          <button key={key} onClick={()=>onChange(key)} style={{padding:"10px 8px",borderRadius:12,border:value===key?`2px solid ${g.color}`:"2px solid #ffffff10",background:value===key?g.color+"15":"#ffffff05",color:value===key?g.color:"#64748b",fontWeight:700,fontSize:11,cursor:"pointer",textAlign:"center"}}>
+            <div style={{fontSize:20,marginBottom:4}}>{g.icon}</div>
+            <div>{g.label}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FilterBar({ value, onChange }) {
+  return (
+    <div style={{display:"flex",gap:8,marginBottom:16,overflowX:"auto",paddingBottom:4}}>
+      {[["all","All","#94a3b8"],...Object.entries(CATEGORIES).map(([k,g])=>[k,`${g.icon} ${g.label}`,g.color])].map(([key,lbl,color])=>(
+        <button key={key} onClick={()=>onChange(key)} style={{padding:"6px 14px",borderRadius:99,border:value===key?`2px solid ${color}`:"2px solid #ffffff10",background:value===key?color+"22":"none",color:value===key?color:"#64748b",fontWeight:700,fontSize:12,cursor:"pointer",whiteSpace:"nowrap"}}>{lbl}</button>
+      ))}
+    </div>
+  );
+}
+
+function ScoutTab() {
+  const [mode,setMode]=useState("camera");
+  const [askPrice,setAsk]=useState("");
+  const [input,setInput]=useState("");
+  const [loading,setLoading]=useState(false);
+  const [result,setResult]=useState(null);
+  const [error,setError]=useState("");
+  const [preview,setPreview]=useState(null);
+  const [imgData,setImgData]=useState(null);
+  const [imgMime,setImgMime]=useState(null);
+  const fileRef=useRef(null);
+
+  const handleFile=async(file)=>{ if(!file)return; const b64=await fileToBase64(file); const mime=file.type||"image/jpeg"; setPreview(`data:${mime};base64,${b64}`); setImgData(b64); setImgMime(mime); setResult(null); setError(""); };
+  const resetImg=()=>{ setPreview(null); setImgData(null); setImgMime(null); setResult(null); setError(""); };
+
+  const scout=async()=>{
+    setLoading(true); setResult(null); setError("");
+    try {
+      let payload=imgData;
+      if(mode==="camera"&&imgData) payload=await compressImage(imgData,imgMime);
+      const r=await scoutItem(mode==="camera"?payload:input, mode==="camera", "image/jpeg", parseFloat(askPrice)||null);
+      setResult(r);
+    } catch(e){ setError("Couldn't analyze — try describing it instead."); }
+    setLoading(false);
+  };
+
+  const verdictColor=(v)=>v==="BUY"?"#4ade80":v==="PASS"?"#f87171":"#f0c040";
+  const riskColor=(r)=>r==="low"?"#4ade80":r==="medium"?"#f0c040":"#f87171";
+  const demandIcon=(d)=>d==="hot"?"🔥":d==="steady"?"✅":"🐢";
+
+  return (
+    <div>
+      <div style={{...S.card,background:"linear-gradient(135deg,#1a0a2e,#0a1628)",borderColor:"#f472b644"}}>
+        <div style={{fontWeight:800,fontSize:18,color:"#f472b6",marginBottom:4}}>🤔 Scout Mode</div>
+        <div style={{fontSize:13,color:"#94a3b8"}}>Snap or describe anything. Get instant buy/pass verdict.</div>
+      </div>
+      <div style={S.card}>
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {[["camera","📷 Photo"],["text","⌨️ Describe"]].map(([m,lbl])=>(
+            <button key={m} onClick={()=>{setMode(m);resetImg();setInput("");}} style={{flex:1,padding:"10px",borderRadius:10,border:mode===m?"2px solid #f472b6":"2px solid #ffffff10",background:mode===m?"#f472b615":"#ffffff05",color:mode===m?"#f472b6":"#64748b",fontWeight:700,fontSize:13,cursor:"pointer"}}>{lbl}</button>
+          ))}
+        </div>
+        <div style={{marginBottom:14}}>
+          <label style={S.lbl}>Asking Price (optional)</label>
+          <input style={S.inp} type="number" placeholder="What are they asking?" value={askPrice} onChange={e=>setAsk(e.target.value)}/>
+        </div>
+        {mode==="camera"&&(
+          <div>
+            {preview?(
+              <div style={{position:"relative",marginBottom:12}}>
+                <img src={preview} alt="item" style={{width:"100%",borderRadius:12,maxHeight:280,objectFit:"contain",background:"#111"}}/>
+                <button onClick={resetImg} style={{position:"absolute",top:8,right:8,background:"#000000aa",border:"none",borderRadius:99,color:"#fff",width:32,height:32,cursor:"pointer"}}>✕</button>
+              </div>
+            ):(
+              <div style={{border:"2px dashed #f472b630",borderRadius:12,padding:28,textAlign:"center",marginBottom:12,background:"#f472b608"}}>
+                <div style={{fontSize:44,marginBottom:8}}>🤔</div>
+                <div style={{color:"#64748b",fontSize:13,marginBottom:14}}>Upload a photo of anything to scout it</div>
+                <button style={{...S.btn("primary","#f472b6","#a855f7")}} onClick={()=>fileRef.current?.click()}>📁 Upload Photo</button>
+              </div>
+            )}
+            <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+          </div>
+        )}
+        {mode==="text"&&(
+          <div style={{marginBottom:12}}>
+            <label style={S.lbl}>What is it?</label>
+            <textarea style={{...S.inp,minHeight:80,resize:"vertical"}} placeholder="e.g. 'Lot of Pokemon cards' or 'Nike Dunk Low size 11'" value={input} onChange={e=>setInput(e.target.value)}/>
+          </div>
+        )}
+        <button style={{...S.btn("primary","#f472b6","#a855f7"),width:"100%",fontSize:15,padding:"13px"}} onClick={scout} disabled={loading||(!imgData&&!input.trim())}>
+          {loading?"⏳ Analyzing...":"🤔 Should I Buy This?"}
+        </button>
+        {error&&<div style={{marginTop:10,color:"#f87171",fontSize:13}}>⚠ {error}</div>}
+      </div>
+      {result&&(
+        <div>
+          <div style={{...S.card,background:result.verdict==="BUY"?"#4ade8015":result.verdict==="PASS"?"#f8717115":"#f0c04015",border:`2px solid ${verdictColor(result.verdict)}44`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:800,fontSize:18,marginBottom:4}}>{result.name}</div>
+                <div style={{fontSize:12,color:"#64748b"}}>{result.conditionNotes}</div>
+              </div>
+              <div style={{textAlign:"center",marginLeft:12}}>
+                <div style={{fontSize:32,fontWeight:900,color:verdictColor(result.verdict)}}>{result.verdict}</div>
+              </div>
+            </div>
+            <div style={{background:"#000000aa",borderRadius:10,padding:"10px 14px",fontSize:13}}>{result.verdictReason}</div>
+          </div>
+          <div style={S.card}>
+            <div style={{fontWeight:700,marginBottom:12}}>💰 Price Breakdown</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
+              {[["Low",result.lowSell,"#f87171"],["Mid",result.midSell,"#f0c040"],["High",result.highSell,"#4ade80"]].map(([l,p,c])=>(
+                <div key={l} style={S.pb(c)}>
+                  <div style={{fontSize:10,color:c,textTransform:"uppercase",marginBottom:4}}>{l}</div>
+                  <div style={{fontSize:20,fontWeight:800,color:c}}>${(p||0).toFixed(2)}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{background:"#ffffff05",borderRadius:12,padding:14}}>
+              {[["Max pay price",`$${(result.maxPayPrice||0).toFixed(2)}`,"#f0c040"],["Est profit",`${(result.estimatedProfit||0)>=0?"+":""}$${(result.estimatedProfit||0).toFixed(2)}`,(result.estimatedProfit||0)>=0?"#4ade80":"#f87171"],["Risk",result.riskLevel,riskColor(result.riskLevel)],["Demand",`${demandIcon(result.demandLevel)} ${result.demandLevel}`,"#e2e8f0"],["Time to sell",result.timeToSell,"#94a3b8"]].map(([l,v,c])=>(
+                <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",fontSize:13,borderBottom:"1px solid #ffffff08"}}>
+                  <span style={{color:"#94a3b8"}}>{l}</span><span style={{fontWeight:700,color:c}}>{v}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {result.tips?.length>0&&(
+            <div style={S.card}>
+              <div style={{fontWeight:700,marginBottom:10}}>💡 Tips</div>
+              {result.tips.map((tip,i)=>(
+                <div key={i} style={{display:"flex",gap:10,padding:"7px 0",fontSize:13,color:"#94a3b8",borderBottom:"1px solid #ffffff08"}}>
+                  <span style={{color:"#f472b6"}}>→</span><span>{tip}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+function ScannerTab({ onAddFlip }) {
+  const [category,setCat]=useState("pokemon");
+  const [mode,setMode]=useState("camera");
+  const [input,setInput]=useState("");
+  const [buyPrice,setBuyPrice]=useState("");
+  const [loading,setLoading]=useState(false);
+  const [result,setResult]=useState(null);
+  const [condition,setCondition]=useState("LP");
+  const [error,setError]=useState("");
+  const [preview,setPreview]=useState(null);
+  const [imgData,setImgData]=useState(null);
+  const [imgMime,setImgMime]=useState(null);
+  const fileRef=useRef(null);
+
+  const g=CATEGORIES[category];
+  const isCard=g.type==="card";
+  const conds=isCard?CARD_CONDITIONS:ITEM_CONDITIONS;
+
+  useEffect(()=>{ setCondition(isCard?"LP":"Good"); setResult(null); },[isCard]);
+
+  const handleFile=async(file)=>{ if(!file)return; const b64=await fileToBase64(file); const mime=file.type||"image/jpeg"; setPreview(`data:${mime};base64,${b64}`); setImgData(b64); setImgMime(mime); setResult(null); setError(""); };
+  const resetImg=()=>{ setPreview(null); setImgData(null); setImgMime(null); setResult(null); setError(""); };
+
+  const identify=async()=>{
+    setLoading(true); setResult(null); setError("");
+    try {
+      let payload=imgData;
+      if(mode==="camera"&&imgData) payload=await compressImage(imgData,imgMime);
+      let d;
+      if(mode==="camera"){ d=isCard?await analyzeCard(payload,category,true,"image/jpeg"):await analyzeItem(payload,category,true,"image/jpeg"); }
+      else { d=isCard?await analyzeCard(input,category,false):await analyzeItem(input,category,false); }
+      if(d.nmPrice){ d.highPrice=d.nmPrice; d.midPrice=d.lpPrice; d.lowPrice=d.mpPrice; }
+      setResult(d);
+    } catch(e){ setError("Couldn't identify — try typing it instead."); }
+    setLoading(false);
+  };
+
+  const sellPrice=result?(isCard?(condition==="NM"?result.highPrice:condition==="LP"?result.midPrice:result.lowPrice)||0:result.midPrice||0):0;
+  const estProfit=sellPrice-(parseFloat(buyPrice)||0)-sellPrice*0.13;
+
+  const addToFlips=()=>{
+    if(!result)return;
+    onAddFlip({ id:Date.now(), category, name:result.name||input, brand:result.brand||"", set:result.set||"", rarity:result.rarity||"", condition, buyPrice:parseFloat(buyPrice)||0, lowPrice:result.lowPrice||0, midPrice:result.midPrice||0, highPrice:result.highPrice||0, trend:result.trend||"stable", notes:result.notes||"", status:"active", listedTitle:result.ebayTitle||result.name||"", addedAt:new Date().toISOString() });
+    setInput(""); setBuyPrice(""); setResult(null); setError(""); setPreview(null); setImgData(null);
+  };
+
+  return (
+    <div>
+      <div style={S.card}>
+        <label style={S.lbl}>Category</label>
+        <CategoryPicker value={category} onChange={(c)=>{ setCat(c); setResult(null); setError(""); resetImg(); }}/>
+        <div style={{display:"flex",gap:8,marginTop:16,marginBottom:16}}>
+          {[["camera","📷 Photo"],["text","⌨️ Type It"]].map(([m,lbl])=>(
+            <button key={m} onClick={()=>{setMode(m);resetImg();setInput("");}} style={{flex:1,padding:"10px",borderRadius:10,border:mode===m?`2px solid ${g.color}`:"2px solid #ffffff10",background:mode===m?g.color+"15":"#ffffff05",color:mode===m?g.color:"#64748b",fontWeight:700,fontSize:13,cursor:"pointer"}}>{lbl}</button>
+          ))}
+        </div>
+        {mode==="camera"&&(
+          <div>
+            {preview?(
+              <div style={{position:"relative",marginBottom:12}}>
+                <img src={preview} alt="item" style={{width:"100%",borderRadius:12,maxHeight:300,objectFit:"contain",background:"#111"}}/>
+                <button onClick={resetImg} style={{position:"absolute",top:8,right:8,background:"#000000aa",border:"none",borderRadius:99,color:"#fff",width:32,height:32,cursor:"pointer"}}>✕</button>
+              </div>
+            ):(
+              <div style={{border:`2px dashed ${g.color}30`,borderRadius:12,padding:32,textAlign:"center",marginBottom:12}}>
+                <div style={{fontSize:48,marginBottom:8}}>{g.icon}</div>
+                <div style={{color:"#64748b",fontSize:13,marginBottom:16}}>Upload a photo to identify & price</div>
+                <button style={{...S.btn("primary",g.color,g.accent)}} onClick={()=>fileRef.current?.click()}>📁 Upload Photo</button>
+              </div>
+            )}
+            <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+          </div>
+        )}
+        {mode==="text"&&(
+          <div>
+            <label style={S.lbl}>Name / Description</label>
+            <textarea style={{...S.inp,minHeight:72,resize:"vertical",marginBottom:12}} placeholder={isCard?"e.g. Charizard GX full art rainbow":"e.g. iPhone 13 Pro 256GB"} value={input} onChange={e=>setInput(e.target.value)}/>
+            <button style={{...S.btn("primary",g.color,g.accent),width:"100%"}} onClick={identify} disabled={loading}>{loading?"⏳ Analyzing...":`${g.icon} Identify & Price`}</button>
+          </div>
+        )}
+        {mode==="camera"&&preview&&!result&&(
+          <button style={{...S.btn("primary",g.color,g.accent),width:"100%",marginTop:8}} onClick={identify} disabled={loading}>{loading?"⏳ Analyzing...":`${g.icon} Identify & Price`}</button>
+        )}
+        {error&&<div style={{marginTop:10,color:"#f87171",fontSize:13}}>⚠ {error}</div>}
+      </div>
+      {result&&(
+        <div style={{...S.card,borderColor:g.color+"44"}}>
+          <div style={{fontWeight:800,fontSize:17,marginBottom:8}}>{result.name}</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
+            <CatBadge cat={category}/>
+            {result.set&&<Pill label={result.set} color="#60a5fa"/>}
+            {result.rarity&&<Pill label={result.rarity} color={g.color}/>}
+          </div>
+          {result.notes&&<div style={{background:"#ffffff08",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#94a3b8",marginBottom:12}}>💡 {result.notes}</div>}
+          <div style={S.pg}>
+            {[["Low",(result.lowPrice||0),"#f87171"],["Mid",(result.midPrice||0),"#f0c040"],["High",(result.highPrice||0),"#4ade80"]].map(([l,p,c])=>(
+              <div key={l} style={S.pb(c)}>
+                <div style={{fontSize:10,color:c,textTransform:"uppercase",marginBottom:4}}>{l}</div>
+                <div style={{fontSize:20,fontWeight:800,color:c}}>${(p||0).toFixed(2)}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{marginTop:16,display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <div>
+              <label style={S.lbl}>Condition</label>
+              <select style={S.inp} value={condition} onChange={e=>setCondition(e.target.value)}>
+                {conds.map(c=><option key={c} value={c}>{CONDITION_MAP[c]}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={S.lbl}>Buy Price ($)</label>
+              <input style={S.inp} type="number" placeholder="0.00" value={buyPrice} onChange={e=>setBuyPrice(e.target.value)}/>
+            </div>
+          </div>
+          {buyPrice&&(
+            <div style={{marginTop:12,background:estProfit>=0?"#4ade8011":"#f8717111",border:`1px solid ${estProfit>=0?"#4ade8033":"#f8717133"}`,borderRadius:10,padding:"10px 14px"}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontSize:13,color:"#94a3b8"}}>Est. profit after fees</span>
+                <span style={{fontWeight:800,color:estProfit>=0?"#4ade80":"#f87171"}}>{estProfit>=0?"+":""}${estProfit.toFixed(2)}</span>
+              </div>
+            </div>
+          )}
+          <button style={{...S.btn("primary",g.color,g.accent),marginTop:14}} onClick={addToFlips}>+ Add to Inventory</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FlipsTab({ flips, onUpdate, onDelete, label, showProfit, filter, onFilter }) {
+  const [editing,setEditing]=useState(null);
+  const [sellPrice,setSellPrice]=useState("");
+  return (
+    <div>
+      <FilterBar value={filter} onChange={onFilter}/>
+      {flips.length===0?(
+        <div style={{...S.card,textAlign:"center",padding:40}}>
+          <div style={{fontSize:40,marginBottom:12}}>📭</div>
+          <div style={{color:"#64748b"}}>No {label.toLowerCase()} yet</div>
+        </div>
+      ):(
+        flips.map(flip=>{
+          const g=CATEGORIES[flip.category]||CATEGORIES.other;
+          const profit=(flip.sellPrice||0)-(flip.buyPrice||0);
+          const potProfit=(flip.midPrice||0)-(flip.buyPrice||0)-((flip.midPrice||0)*0.13);
+          return (
+            <div key={flip.id} style={{...S.fc,borderLeft:`3px solid ${g.color}55`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:14,marginBottom:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{flip.name}</div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+                    <CatBadge cat={flip.category}/>
+                    <Pill label={CONDITION_MAP[flip.condition]||flip.condition} color="#60a5fa"/>
+                  </div>
+                  <div style={{display:"flex",gap:16,fontSize:13}}>
+                    <span style={{color:"#94a3b8"}}>Paid <span style={{color:"#e2e8f0",fontWeight:700}}>${(flip.buyPrice||0).toFixed(2)}</span></span>
+                    {showProfit&&flip.sellPrice?(
+                      <span style={{color:profit>=0?"#4ade80":"#f87171",fontWeight:700}}>{profit>=0?"+":""}${profit.toFixed(2)}</span>
+                    ):(
+                      <span style={{color:potProfit>=0?"#4ade80":"#f87171",fontWeight:700}}>est {potProfit>=0?"+":""}${potProfit.toFixed(2)}</span>
+                    )}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,marginLeft:12}}>
+                  {!showProfit&&editing!==flip.id&&<button style={S.btn("primary",g.color,g.accent)} onClick={()=>{setEditing(flip.id);setSellPrice(String(flip.midPrice||""));}}>Sold</button>}
+                  <button style={S.btn("danger")} onClick={()=>onDelete(flip.id)}>✕</button>
+                </div>
+              </div>
+              {editing===flip.id&&(
+                <div style={{marginTop:12,padding:12,background:"#ffffff05",borderRadius:10}}>
+                  <label style={S.lbl}>Sold Price ($)</label>
+                  <div style={{display:"flex",gap:8}}>
+                    <input style={{...S.inp,flex:1}} type="number" value={sellPrice} onChange={e=>setSellPrice(e.target.value)}/>
+                    <button style={S.btn("primary",g.color,g.accent)} onClick={()=>{onUpdate(flip.id,{status:"sold",sellPrice:parseFloat(sellPrice)||0,soldAt:new Date().toISOString()});setEditing(null);}}>Confirm</button>
+                    <button style={S.btn("ghost")} onClick={()=>setEditing(null)}>Cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+function BudgetTab({ budget, onSave, invested, profit, flips }) {
+  const [input,setInput]=useState(String(budget||""));
+  const remaining=budget-invested;
+  const soldFlips=flips.filter(f=>f.status==="sold");
+  const roi=invested>0?((profit/invested)*100).toFixed(1):0;
+  return (
+    <div>
+      <div style={S.card}>
+        <label style={S.lbl}>Flip Budget ($)</label>
+        <div style={{display:"flex",gap:10}}>
+          <input style={{...S.inp,flex:1}} type="number" value={input} onChange={e=>setInput(e.target.value)} placeholder="500"/>
+          <button style={S.btn("primary")} onClick={()=>onSave(parseFloat(input)||0)}>Save</button>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+        {[["Budget",`$${budget.toFixed(0)}`,"#60a5fa"],["Invested",`$${invested.toFixed(0)}`,"#f0c040"],["Remaining",`$${remaining.toFixed(0)}`,remaining>=0?"#4ade80":"#f87171"],["Profit",`${profit>=0?"+":""}$${Math.abs(profit).toFixed(0)}`,profit>=0?"#4ade80":"#f87171"],["ROI",`${roi}%`,parseFloat(roi)>=0?"#4ade80":"#f87171"],["Sold",soldFlips.length,"#94a3b8"]].map(([l,v,c])=>(
+          <div key={l} style={{...S.card,textAlign:"center",padding:16,marginBottom:0}}>
+            <div style={{fontSize:22,fontWeight:800,color:c}}>{v}</div>
+            <div style={{fontSize:11,color:"#475569",textTransform:"uppercase",letterSpacing:1,marginTop:4}}>{l}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EbayTab({ flips, settings, onSaveSettings }) {
+  const [s,setS]=useState(settings);
+  const [selected,setSel]=useState({});
+  const [generating,setGen]=useState(false);
+  const [done,setDone]=useState(false);
+  useEffect(()=>setS(settings),[settings]);
+  const toggleAll=()=>{ if(Object.keys(selected).length===flips.length)setSel({}); else{const n={};flips.forEach(f=>n[f.id]=true);setSel(n);} };
+  const toggle=(id)=>setSel(p=>{const n={...p};n[id]?delete n[id]:n[id]=true;return n;});
+  const selectedFlips=flips.filter(f=>selected[f.id]);
+  const exportCSV=async()=>{
+    if(!selectedFlips.length)return;
+    setGen(true); setDone(false);
+    const rows=[];
+    for(let i=0;i<selectedFlips.length;i++){
+      const flip=selectedFlips[i];
+      try{ const desc=await genDescription(flip.name,flip.condition,flip.category); rows.push(buildRow(flip,desc,s)); }
+      catch{ rows.push(buildRow(flip,`${flip.name} - ${CONDITION_MAP[flip.condition]||flip.condition} condition.`,s)); }
+    }
+    downloadCSV(rows); setDone(true); setGen(false);
+  };
+  return (
+    <div>
+      <div style={S.card}>
+        <div style={{fontWeight:700,marginBottom:12}}>⚙️ Settings</div>
+        <div style={{marginBottom:12}}>
+          <label style={S.lbl}>Markup % above mid price</label>
+          <input style={S.inp} type="number" value={s.markup||10} onChange={e=>setS({...s,markup:parseFloat(e.target.value)||0})}/>
+        </div>
+        <button style={{...S.btn("primary"),width:"100%"}} onClick={()=>onSaveSettings(s)}>Save Settings</button>
+      </div>
+      <div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <div style={{fontWeight:700}}>Select Items</div>
+          <button style={{...S.btn("ghost"),fontSize:11,padding:"6px 12px"}} onClick={toggleAll}>{Object.keys(selected).length===flips.length?"Deselect All":"Select All"}</button>
+        </div>
+        {flips.length===0?<div style={{color:"#64748b",textAlign:"center",padding:20}}>No items yet</div>:(
+          flips.map(flip=>{
+            const g=CATEGORIES[flip.category]||CATEGORIES.other;
+            const isSel=!!selected[flip.id];
+            return (
+              <div key={flip.id} onClick={()=>toggle(flip.id)} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderBottom:"1px solid #ffffff08",cursor:"pointer",opacity:isSel?1:0.6}}>
+                <div style={{width:20,height:20,borderRadius:6,border:`2px solid ${isSel?g.color:"#ffffff20"}`,background:isSel?g.color+"33":"none",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  {isSel&&<span style={{color:g.color,fontSize:12}}>✓</span>}
+                </div>
+                <span>{g.icon}</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{flip.name}</div>
+                  <div style={{fontSize:11,color:"#64748b"}}>{CONDITION_MAP[flip.condition]||flip.condition}</div>
+                </div>
+                <div style={{fontSize:13,fontWeight:700,color:"#4ade80"}}>${((flip.midPrice||0)*(1+(s.markup||10)/100)).toFixed(2)}</div>
+              </div>
+            );
+          })
+        )}
+      </div>
+      {selectedFlips.length>0&&(
+        <div style={S.card}>
+          {done&&<div style={{background:"#4ade8011",border:"1px solid #4ade8033",borderRadius:8,padding:"10px 14px",marginBottom:12,fontSize:13,color:"#4ade80"}}>✓ CSV downloaded!</div>}
+          <button style={{...S.btn("ebay"),width:"100%",fontSize:15,padding:"14px"}} onClick={exportCSV} disabled={generating}>
+            {generating?"⏳ Generating...":`🛒 Download eBay CSV (${selectedFlips.length} items)`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+export default function App() {
+  const [tab,setTab]=useState("scout");
+  const [flips,setFlips]=useState([]);
+  const [budget,setBudget]=useState(0);
+  const [filter,setFilter]=useState("all");
+  const [ebaySettings,setEbaySettings]=useState({markup:10});
+
+  useEffect(()=>{
+    try{
+      const s=localStorage.getItem(STORAGE_KEY); if(s)setFlips(JSON.parse(s));
+      const b=localStorage.getItem(BUDGET_KEY); if(b)setBudget(parseFloat(b));
+      const e=localStorage.getItem(EBAY_KEY); if(e)setEbaySettings(JSON.parse(e));
+    }catch{}
+  },[]);
+
+  const saveFlips=(f)=>{ setFlips(f); try{localStorage.setItem(STORAGE_KEY,JSON.stringify(f));}catch{} };
+  const saveBudget=(b)=>{ setBudget(b); try{localStorage.setItem(BUDGET_KEY,String(b));}catch{} };
+  const saveEbay=(e)=>{ setEbaySettings(e); try{localStorage.setItem(EBAY_KEY,JSON.stringify(e));}catch{} };
+  const addFlip=(f)=>saveFlips([f,...flips]);
+  const updateFlip=(id,u)=>saveFlips(flips.map(f=>f.id===id?{...f,...u}:f));
+  const deleteFlip=(id)=>saveFlips(flips.filter(f=>f.id!==id));
+
+  const active=flips.filter(f=>f.status!=="sold");
+  const sold=flips.filter(f=>f.status==="sold");
+  const invested=active.reduce((s,f)=>s+(f.buyPrice||0),0);
+  const profit=sold.reduce((s,f)=>s+((f.sellPrice||0)-(f.buyPrice||0)),0);
+  const fActive=active.filter(f=>filter==="all"||f.category===filter);
+  const fSold=sold.filter(f=>filter==="all"||f.category===filter);
+
+  return (
+    <div style={S.app}>
+      <div style={S.hdr}>
+        <div style={S.logo}>⚡ FlipPro</div>
+        <div style={S.sub}>Cards · Electronics · Sneakers · Anything</div>
+        <div style={S.srow}>
+          {[[active.length,"Active","#f0c040"],[`${profit>=0?"+":""}$${Math.abs(profit).toFixed(0)}`,"Profit",profit>=0?"#4ade80":"#f87171"],[`$${invested.toFixed(0)}`,"Invested","#f0c040"],[`$${budget.toFixed(0)}`,"Budget","#60a5fa"]].map(([v,l,c])=>(
+            <div key={l}>
+              <div style={{fontSize:20,fontWeight:800,color:c}}>{v}</div>
+              <div style={{fontSize:10,color:"#475569",textTransform:"uppercase",letterSpacing:1}}>{l}</div>
+            </div>
+          ))}
+        </div>
+        <div style={S.tabs}>
+          {[["scout","🤔 Scout"],["scanner","📷 Scan"],["active","📦 Active"],["sold","💰 Sold"],["budget","💵 Budget"],["ebay","🛒 eBay"]].map(([t,lbl])=>(
+            <button key={t} style={S.tab(tab===t,t==="ebay"?"#e53238":t==="scout"?"#f472b6":"#f0c040")} onClick={()=>setTab(t)}>{lbl}</button>
+          ))}
+        </div>
+      </div>
+      <div style={S.wrap}>
+        {tab==="scout"&&<ScoutTab/>}
+        {tab==="scanner"&&<ScannerTab onAddFlip={addFlip}/>}
+        {tab==="active"&&<FlipsTab flips={fActive} onUpdate={updateFlip} onDelete={deleteFlip} label="Active" filter={filter} onFilter={setFilter}/>}
+        {tab==="sold"&&<FlipsTab flips={fSold} onUpdate={updateFlip} onDelete={deleteFlip} label="Sold" showProfit filter={filter} onFilter={setFilter}/>}
+        {tab==="budget"&&<BudgetTab budget={budget} onSave={saveBudget} invested={invested} profit={profit} flips={flips}/>}
+        {tab==="ebay"&&<EbayTab flips={active} settings={ebaySettings} onSaveSettings={saveEbay}/>}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
